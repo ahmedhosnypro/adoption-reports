@@ -172,7 +172,7 @@ jobs:
           transcript="${RUNNER_TEMP}/run-transcript.jsonl"
           set +e
           craft-agent run --agent adoption-analyst --prompt missions/adoption-report.md \
-            --max-turns 150 --max-tokens 8000000 --output-format stream-json \
+            --max-turns 200 --max-tokens 8000000 --output-format stream-json \
             > "$transcript"
           rc=$?
           set -e
