@@ -1,0 +1,196 @@
+name: adoption-scan
+on: workflow_dispatch
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: adoption-scan
+  cancel-in-progress: false
+
+env:
+  RELEASE_REPO: ahmedhosnypro/craft-agent
+  CRAFT_AGENT_VERSION: v1.0.0
+  GATEWAY_REPO: ahmedhosnypro/ironrouter-backend
+  GATEWAY_DUMP: ironrouter-registry.dump
+  GATEWAY_BIN: target/release/app
+  GATEWAY_PORT: "17844"
+  EXPECTED_MODEL: glm-5.3-flash
+  CRAFT_AGENT_EGRESS_ALLOWLIST: github.com,api.github.com,codeload.github.com,objects.githubusercontent.com
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the reports repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Clone the private gateway repo (token never in URL, config, or logs)
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          auth="Authorization: Basic $(printf 'x-access-token:%s' "$PRIVATE_REPO_TOKEN" | base64)"
+          git -c "http.https://github.com/.extraheader=${auth}" \
+            clone --depth 1 "https://github.com/${GATEWAY_REPO}.git" \
+            "${RUNNER_TEMP}/gateway"
+
+      - name: Start postgres and restore the registry dump
+        env:
+          IRONROUTER_DB_PASSWORD: ${{ secrets.IRONROUTER_DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          docker run -d --name ironrouter_postgres --network host \
+            -e POSTGRES_USER=ironrouter \
+            -e POSTGRES_PASSWORD="$IRONROUTER_DB_PASSWORD" \
+            -e POSTGRES_DB=ironrouter_live \
+            -v ironrouter_pgdata:/var/lib/postgresql/data \
+            postgres:17 -p 5434
+          ready=0
+          for _ in $(seq 1 30); do
+            if docker exec ironrouter_postgres pg_isready -p 5434 -U ironrouter >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::postgres never became ready on :5434"
+            exit 1
+          fi
+          docker exec -i ironrouter_postgres pg_restore -p 5434 -U ironrouter \
+            -d ironrouter_live --clean --if-exists \
+            < "${RUNNER_TEMP}/gateway/${GATEWAY_DUMP}"
+
+      - name: Boot the gateway from the prebuilt binary
+        env:
+          IR_MASTER_KEY: ${{ secrets.IR_MASTER_KEY }}
+          IRONROUTER_DB_PASSWORD: ${{ secrets.IRONROUTER_DB_PASSWORD }}
+        working-directory: ${{ runner.temp }}/gateway
+        run: |
+          set -euo pipefail
+          umask 077
+          export DATABASE_URL="postgres://ironrouter:${IRONROUTER_DB_PASSWORD}@127.0.0.1:5434/ironrouter_live"
+          export HOST=127.0.0.1
+          export PORT="${GATEWAY_PORT}"
+          export BACKEND_URL="http://localhost:${GATEWAY_PORT}"
+          export RUST_ENV=development
+          export COOKIE_SECURE=false
+          export RUST_LOG=info
+          export IR_MASTER_KEY
+          nohup "./${GATEWAY_BIN}" > "${RUNNER_TEMP}/gateway.log" 2>&1 &
+
+      - name: Wait for the gateway (healthz, then authed model listing)
+        env:
+          IRONROUTER_CLIENT_KEY: ${{ secrets.IRONROUTER_CLIENT_KEY }}
+        run: |
+          set -euo pipefail
+          live=0
+          for _ in $(seq 1 36); do
+            if curl -fsS --max-time 2 "http://localhost:${GATEWAY_PORT}/healthz" >/dev/null 2>&1; then
+              live=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$live" -ne 1 ]; then
+            echo "::error::gateway /healthz never answered on :${GATEWAY_PORT}"
+            tail -n 20 "${RUNNER_TEMP}/gateway.log" || true
+            exit 1
+          fi
+          ready=0
+          for _ in $(seq 1 12); do
+            if curl -fsS -H "Authorization: Bearer ${IRONROUTER_CLIENT_KEY}" \
+              "http://localhost:${GATEWAY_PORT}/v1/models" 2>/dev/null \
+              | grep -q "${EXPECTED_MODEL}"; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::/v1/models never listed ${EXPECTED_MODEL} (caller key or master key mismatch)"
+            exit 1
+          fi
+
+      - name: Download and sha256-verify the craft-agent release binaries
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          bin_dir="${RUNNER_TEMP}/craft-bin"
+          mkdir -p "$bin_dir"
+          export GH_TOKEN="$PRIVATE_REPO_TOKEN"
+          release_json="$(gh api "repos/${RELEASE_REPO}/releases/tags/${CRAFT_AGENT_VERSION}")"
+          for name in checksums.txt craft-agent-x86_64-unknown-linux-musl \
+                      craft-helpers-x86_64-unknown-linux-musl; do
+            asset_id="$(printf '%s' "$release_json" | jq -r --arg n "$name" \
+              '.assets[] | select(.name == $n) | .id')"
+            if [ -z "$asset_id" ] || [ "$asset_id" = "null" ]; then
+              echo "::error::release ${CRAFT_AGENT_VERSION} carries no asset named ${name}"
+              exit 1
+            fi
+            curl -fsSL -H "Authorization: Bearer ${PRIVATE_REPO_TOKEN}" \
+              -H "Accept: application/octet-stream" -o "${bin_dir}/${name}" \
+              "https://api.github.com/repos/${RELEASE_REPO}/releases/assets/${asset_id}" \
+              || gh release download "${CRAFT_AGENT_VERSION}" -R "${RELEASE_REPO}" \
+                --pattern "${name}" --dir "${bin_dir}" --clobber
+          done
+          (
+            cd "$bin_dir"
+            sha256sum --check checksums.txt --ignore-missing
+          )
+          sudo install -m 0755 "${bin_dir}/craft-agent-x86_64-unknown-linux-musl" /usr/local/bin/craft-agent
+          sudo install -m 0755 "${bin_dir}/craft-helpers-x86_64-unknown-linux-musl" /usr/local/bin/craft-helpers
+
+      - name: Run the adoption-scan mission
+        id: agent
+        env:
+          BYOK_BASE_URL: ${{ secrets.BYOK_BASE_URL }}
+          BYOK_API_KEY: ${{ secrets.BYOK_API_KEY }}
+          BYOK_MODEL: ${{ secrets.BYOK_MODEL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "craft-agent"
+          git config --global user.email "agent@craft-agent.invalid"
+          export CRAFT_AGENT_PROVIDER=openai
+          export CRAFT_AGENT_MODEL="${BYOK_MODEL}"
+          export OPENAI_BASE_URL="${BYOK_BASE_URL}"
+          export OPENAI_API_KEY="${BYOK_API_KEY}"
+          export CRAFT_AGENT_WRITE_REPO="${GITHUB_REPOSITORY}"
+          stream="${RUNNER_TEMP}/craft-agent-stream.jsonl"
+          set +e
+          craft-agent run --agent adoption-scan --prompt missions/adoption-scan.md \
+            --max-turns 150 --max-tokens 8000000 --output-format stream-json \
+            > "$stream"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) conclusion="success" ;;
+            2) conclusion="max-turns" ;;
+            3) conclusion="budget" ;;
+            4) conclusion="denied" ;;
+            *) conclusion="error" ;;
+          esac
+          echo "conclusion=${conclusion}" >> "$GITHUB_OUTPUT"
+          echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::craft-agent exited ${rc} (${conclusion})"
+            tail -n 5 "$stream" || true
+          fi
+          exit "$rc"
+
+      - name: Upload the agent stream
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: craft-agent-stream
+          path: ${{ runner.temp }}/craft-agent-stream.jsonl
+          if-no-files-found: warn
