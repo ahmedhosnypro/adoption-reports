@@ -1,6 +1,6 @@
 # Mission: cross-repo adoption report — photocraft + filmcraft, last 24h
 
-You are craft-agent running in this repository's adoption-scan
+You are craft-agent running in this repository's adoption-report
 workflow. Study the last 24 hours of merged pull requests in the public
 repositories storytold/photocraft and storytold/filmcraft, find what is
 adoptable or shareable between them (patterns, fixes, helpers,
