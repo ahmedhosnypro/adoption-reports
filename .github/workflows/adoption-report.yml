@@ -11,7 +11,7 @@ concurrency:
 
 env:
   RELEASE_REPO: ahmedhosnypro/craft-agent
-  CRAFT_AGENT_VERSION: v1.0.0
+  CRAFT_AGENT_VERSION: v1
   MODEL_GATEWAY_REPO: ahmedhosnypro/ironrouter-backend
   MODEL_GATEWAY_DUMP: ironrouter-registry.dump
   MODEL_GATEWAY_BIN: target/release/app
